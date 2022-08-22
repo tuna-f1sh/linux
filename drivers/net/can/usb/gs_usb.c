@@ -16,6 +16,9 @@
 #include <linux/netdevice.h>
 #include <linux/signal.h>
 #include <linux/usb.h>
+#include <linux/timecounter.h>
+#include <linux/workqueue.h>
+#include <linux/clocksource.h>
 
 #include <linux/can.h>
 #include <linux/can/dev.h>
@@ -36,6 +39,13 @@
 
 #define GSUSB_ENDPOINT_IN 1
 #define GSUSB_ENDPOINT_OUT 2
+
+/* Timestamp 32 bit timer runs at 1 MHz (1 us tick). Worker accounts for timer
+ * overflow (will be after ~71 minutes) */
+#define GSUSB_TIMESTAMP_TIMER_HZ 1e6
+#define GSUSB_TIMESTAMP_WORK_DELAY_SEC 1800
+static_assert(GSUSB_TIMESTAMP_WORK_DELAY_SEC <
+	      CYCLECOUNTER_MASK(32) / GSUSB_TIMESTAMP_TIMER_HZ / 2);
 
 /* Device specific constants */
 enum gs_usb_breq {
@@ -199,6 +209,11 @@ struct classic_can {
 	u8 data[8];
 } __packed;
 
+struct classic_can_ts {
+	u8 data[8];
+	u32 timestamp_us;
+} __packed;
+
 struct classic_can_quirk {
 	u8 data[8];
 	u8 quirk;
@@ -206,6 +221,11 @@ struct classic_can_quirk {
 
 struct canfd {
 	u8 data[64];
+} __packed;
+
+struct canfd_ts {
+	u8 data[64];
+	u32 timestamp_us;
 } __packed;
 
 struct canfd_quirk {
@@ -225,7 +245,9 @@ struct gs_host_frame {
 	union {
 		DECLARE_FLEX_ARRAY(struct classic_can, classic_can);
 		DECLARE_FLEX_ARRAY(struct classic_can_quirk, classic_can_quirk);
+		DECLARE_FLEX_ARRAY(struct classic_can_ts, classic_can_ts);
 		DECLARE_FLEX_ARRAY(struct canfd, canfd);
+		DECLARE_FLEX_ARRAY(struct canfd_ts, canfd_ts);
 		DECLARE_FLEX_ARRAY(struct canfd_quirk, canfd_quirk);
 	};
 } __packed;
@@ -258,6 +280,11 @@ struct gs_can {
 
 	struct can_bittiming_const bt_const, data_bt_const;
 	unsigned int channel;	/* channel number */
+
+	/* time counter for hardware timestamps */
+	struct cyclecounter cc;
+	struct timecounter tc;
+	struct delayed_work timestamp;
 
 	u32 feature;
 	unsigned int hf_size_tx;
@@ -351,6 +378,83 @@ static int gs_cmd_reset(struct gs_can *gsdev)
 	return rc;
 }
 
+static int gs_usb_get_sof_timestamp(struct net_device *netdev,
+				    u32 *sof_timestamp_us)
+{
+	struct gs_can *dev = netdev_priv(netdev);
+	int rc;
+
+	rc = usb_control_msg_recv(interface_to_usbdev(dev->iface),
+			     usb_sndctrlpipe(interface_to_usbdev(dev->iface), 0),
+			     GS_USB_BREQ_TIMESTAMP,
+			     USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
+			     dev->channel, 0,
+			     sof_timestamp_us, sizeof(*sof_timestamp_us),
+			     USB_CTRL_GET_TIMEOUT,
+			     GFP_KERNEL);
+
+	return (rc > 0) ? 0 : rc;
+}
+
+static u64 gs_usb_timestamp_read(const struct cyclecounter *cc)
+{
+	const struct gs_can *dev;
+	u32 timestamp = 0;
+	int err;
+
+	dev = container_of(cc, struct gs_can, cc);
+	err = gs_usb_get_sof_timestamp(dev->netdev, &timestamp);
+	if (err)
+		netdev_err(dev->netdev,
+			   "Error %d while reading timestamp. HW timestamps may be inaccurate.",
+			   err);
+
+	return timestamp;
+}
+
+static void gs_usb_set_timestamp(struct gs_can *dev,
+				 struct sk_buff *skb, u32 timestamp)
+{
+	struct skb_shared_hwtstamps *hwtstamps = skb_hwtstamps(skb);
+	u64 ns;
+
+	ns = timecounter_cyc2time(&dev->tc, timestamp);
+	hwtstamps->hwtstamp = ns_to_ktime(ns);
+}
+
+static void gs_usb_timestamp_work(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = to_delayed_work(work);
+	struct gs_can *dev;
+
+	dev = container_of(delayed_work, struct gs_can, timestamp);
+	timecounter_read(&dev->tc);
+
+	schedule_delayed_work(&dev->timestamp,
+			      GSUSB_TIMESTAMP_WORK_DELAY_SEC * HZ);
+}
+
+void gs_usb_timestamp_init(struct gs_can *dev)
+{
+	struct cyclecounter *cc = &dev->cc;
+
+	cc->read = gs_usb_timestamp_read;
+	cc->mask = CYCLECOUNTER_MASK(32);
+	cc->shift = 1;
+	cc->mult = clocksource_hz2mult(GSUSB_TIMESTAMP_TIMER_HZ, cc->shift);
+
+	timecounter_init(&dev->tc, &dev->cc, ktime_get_real_ns());
+
+	INIT_DELAYED_WORK(&dev->timestamp, gs_usb_timestamp_work);
+	schedule_delayed_work(&dev->timestamp,
+			      GSUSB_TIMESTAMP_WORK_DELAY_SEC * HZ);
+}
+
+void gs_usb_timestamp_stop(struct gs_can *dev)
+{
+	cancel_delayed_work_sync(&dev->timestamp);
+}
+
 static void gs_update_state(struct gs_can *dev, struct can_frame *cf)
 {
 	struct can_device_stats *can_stats = &dev->can.can_stats;
@@ -428,6 +532,11 @@ static void gs_usb_receive_bulk_callback(struct urb *urb)
 				cfd->flags |= CANFD_ESI;
 
 			memcpy(cfd->data, hf->canfd->data, cfd->len);
+
+			/* set hardware timestamp if supported */
+			if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP) {
+				gs_usb_set_timestamp(dev, skb, le32_to_cpu(hf->canfd_ts->timestamp_us));
+			}
 		} else {
 			skb = alloc_can_skb(dev->netdev, &cf);
 			if (!skb)
@@ -437,6 +546,11 @@ static void gs_usb_receive_bulk_callback(struct urb *urb)
 			can_frame_set_cc_len(cf, hf->can_dlc, dev->can.ctrlmode);
 
 			memcpy(cf->data, hf->classic_can->data, 8);
+
+			/* set hardware timestamp if supported */
+			if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP) {
+				gs_usb_set_timestamp(dev, skb, le32_to_cpu(hf->classic_can_ts->timestamp_us));
+			}
 
 			/* ERROR frames tell us information about the controller */
 			if (le32_to_cpu(hf->can_id) & CAN_ERR_FLAG)
@@ -814,6 +928,10 @@ static int gs_can_open(struct net_device *netdev)
 	else if (ctrlmode & CAN_CTRLMODE_LISTENONLY)
 		flags |= GS_CAN_MODE_LISTEN_ONLY;
 
+	/* if hardware supports timestamps, enable it */
+	if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP)
+		flags |= GS_CAN_MODE_HW_TIMESTAMP;
+
 	/* Controller is not allowed to retry TX
 	 * this mode is unavailable on atmels uc3c hardware
 	 */
@@ -837,6 +955,10 @@ static int gs_can_open(struct net_device *netdev)
 		kfree(dm);
 		return rc;
 	}
+
+	/* start polling sof timestamp */
+	if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP)
+		gs_usb_timestamp_init(dev);
 
 	kfree(dm);
 
@@ -869,6 +991,10 @@ static int gs_can_close(struct net_device *netdev)
 					  dev->rxbuf_dma[i]);
 	}
 
+	/* Stop polling sof timestamp */
+	if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP)
+		gs_usb_timestamp_stop(dev);
+
 	/* Stop sending URBs */
 	usb_kill_anchored_urbs(&dev->tx_submitted);
 	atomic_set(&dev->active_tx_urbs, 0);
@@ -895,6 +1021,7 @@ static const struct net_device_ops gs_usb_netdev_ops = {
 	.ndo_stop = gs_can_close,
 	.ndo_start_xmit = gs_can_start_xmit,
 	.ndo_change_mtu = can_change_mtu,
+	.ndo_eth_ioctl = can_eth_ioctl_hwts,
 };
 
 static int gs_usb_set_identify(struct net_device *netdev, bool do_identify)
@@ -946,7 +1073,7 @@ static int gs_usb_set_phys_id(struct net_device *dev,
 
 static const struct ethtool_ops gs_usb_ethtool_ops = {
 	.set_phys_id = gs_usb_set_phys_id,
-	.get_ts_info = ethtool_op_get_ts_info,
+	.get_ts_info = can_ethtool_op_get_ts_info_hwts,
 };
 
 static struct gs_can *gs_make_candev(unsigned int channel,
@@ -1228,8 +1355,17 @@ static int gs_usb_probe(struct usb_interface *intf,
 		}
 		dev->canch[i]->parent = dev;
 
-		if (dev->canch[i]->can.ctrlmode_supported & CAN_CTRLMODE_FD)
-			dev->hf_size_rx = struct_size(hf, canfd, 1);
+		/* set rx packet size based on FD and if hardware timestamps are
+		 * supported.
+		 */
+		if (dev->canch[i]->can.ctrlmode_supported & CAN_CTRLMODE_FD) {
+			if (dev->canch[i]->feature & GS_CAN_FEATURE_HW_TIMESTAMP)
+				dev->hf_size_rx = struct_size(hf, canfd_ts, 1);
+			else
+				dev->hf_size_rx = struct_size(hf, canfd, 1);
+		} else if (dev->canch[i]->feature & GS_CAN_FEATURE_HW_TIMESTAMP) {
+			dev->hf_size_rx = struct_size(hf, classic_can_ts, 1);
+		}
 	}
 
 	kfree(dconf);
