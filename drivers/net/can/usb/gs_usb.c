@@ -1016,12 +1016,37 @@ static int gs_can_close(struct net_device *netdev)
 	return 0;
 }
 
+static int gs_can_eth_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+{
+	struct hwtstamp_config hwts_cfg = { 0 };
+
+	switch (cmd) {
+	case SIOCSHWTSTAMP: /* set */
+		if (copy_from_user(&hwts_cfg, ifr->ifr_data, sizeof(hwts_cfg)))
+			return -EFAULT;
+		if (hwts_cfg.tx_type == HWTSTAMP_TX_OFF &&
+		    hwts_cfg.rx_filter == HWTSTAMP_FILTER_ALL)
+			return 0;
+		return -ERANGE;
+
+	case SIOCGHWTSTAMP: /* get */
+		hwts_cfg.tx_type = HWTSTAMP_TX_OFF;
+		hwts_cfg.rx_filter = HWTSTAMP_FILTER_ALL;
+		if (copy_to_user(ifr->ifr_data, &hwts_cfg, sizeof(hwts_cfg)))
+			return -EFAULT;
+		return 0;
+
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct net_device_ops gs_usb_netdev_ops = {
 	.ndo_open = gs_can_open,
 	.ndo_stop = gs_can_close,
 	.ndo_start_xmit = gs_can_start_xmit,
 	.ndo_change_mtu = can_change_mtu,
-	.ndo_eth_ioctl = can_eth_ioctl_hwts,
+	.ndo_eth_ioctl = gs_can_eth_ioctl,
 };
 
 static int gs_usb_set_identify(struct net_device *netdev, bool do_identify)
@@ -1071,9 +1096,31 @@ static int gs_usb_set_phys_id(struct net_device *dev,
 	return rc;
 }
 
+int  gs_usb_get_ts_info_hwts(struct net_device *netdev,
+				    struct ethtool_ts_info *info)
+{
+	struct gs_can *dev = netdev_priv(netdev);
+
+	info->so_timestamping =
+		SOF_TIMESTAMPING_TX_SOFTWARE |
+		SOF_TIMESTAMPING_RX_SOFTWARE |
+		SOF_TIMESTAMPING_SOFTWARE;
+	info->phc_index = -1;
+	info->tx_types = BIT(HWTSTAMP_TX_OFF);
+	info->rx_filters = BIT(HWTSTAMP_FILTER_ALL);
+
+	/* report if device supports HW timestamps but only RX */
+	if (dev->feature & GS_CAN_FEATURE_HW_TIMESTAMP)
+		info->so_timestamping |=
+			SOF_TIMESTAMPING_RX_HARDWARE |
+			SOF_TIMESTAMPING_RAW_HARDWARE;
+
+	return 0;
+}
+
 static const struct ethtool_ops gs_usb_ethtool_ops = {
 	.set_phys_id = gs_usb_set_phys_id,
-	.get_ts_info = can_ethtool_op_get_ts_info_hwts,
+	.get_ts_info = gs_usb_get_ts_info_hwts,
 };
 
 static struct gs_can *gs_make_candev(unsigned int channel,
